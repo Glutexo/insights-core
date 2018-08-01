@@ -3,15 +3,33 @@ import os
 import pytest
 import time
 
+from datetime import datetime, timedelta
 from insights.client import InsightsClient
 from insights.client.archive import InsightsArchive
 from insights.client.config import InsightsConfig
 from insights.client.client import _delete_archive_internal
 from insights import package_info
 from insights.client.constants import InsightsConstants as constants
+from insights.client.connection import InsightsConnection
 from insights.client.utilities import generate_machine_id
-from mock.mock import patch
-from mock.mock import Mock
+from mock.mock import call, Mock, patch
+from os.path import lexists
+
+
+class CurrentTimeMatcher():
+    """
+    Matches a ISO timestamp if it is now or a little before. Used to check that something didn't happen eons ago.
+    """
+
+    def __init__(self):
+        self.now = datetime.now()
+
+    def __eq__(self, other_str):
+        # *** Could be done in a less cryptic way by using dateutils library.
+        other_ts = datetime.strptime(other_str, '%Y-%m-%dT%H:%M:%S.%f')
+
+        delta = self.now - other_ts
+        return delta < timedelta(seconds=5)  # *** Assume that the tests as a whole don't run longer than 5 minutes.
 
 
 class FakeConnection(object):
@@ -51,25 +69,55 @@ def test_version():
         sys.argv = tmp
 
 
-@pytest.mark.skip(reason="Mocked paths not working in QE jenkins")
-@patch('insights.client.utilities.constants.registered_files',
-       ['/tmp/insights-client.registered',
-        '/tmp/redhat-access-insights.registered'])
-@patch('insights.client.utilities.constants.unregistered_files',
-       ['/tmp/insights-client.unregistered',
-        '/tmp/redhat-access-insights.unregistered'])
-@patch('insights.client.utilities.constants.machine_id_file',
-       '/tmp/machine-id')
-def test_register():
+def register_lexists(filename):
+    """
+    Mocks a situation, when a machine is unregistered: there is an .unregistered file, but no .registered one.
+    """
+    # *** I don't like much configuring the mock at two places at once: inside the test and in the patch call. Thus
+    #     putting this method outside to pass it to patch then.
+    if filename in constants.registered_files:
+        return False
+    elif filename in constants.unregistered_files:
+        return True
+    else:
+        return lexists(filename)
+
+
+@patch("insights.client.utilities.os.path.lexists", register_lexists)
+@patch("insights.client.utilities.open")
+@patch("insights.client.utilities.os.remove")
+def test_register(os_remove, builtin_open):
     config = InsightsConfig(register=True)
     client = InsightsClient(config)
-    client.connection = FakeConnection()
+    client.connection = Mock(**{"api_registration_check.return_value": None,
+                                "register.return_value": ("msg", "hostname", "None", "")})
     client.session = True
-    assert client.register() is True
+
+    # *** I'd personally put both of these checks into another test. Also removed "== True".
+    assert client.register()
+    client.connection.register.assert_called_once()
+
+    open_calls = []
+    write_calls = []
     for r in constants.registered_files:
-        assert os.path.isfile(r) is True
+        open_call = call(r, "wb")
+        open_calls.append(open_call)
+
+        write_call = call(CurrentTimeMatcher())
+        write_calls.append(write_call)
+
+    # *** The any_order is required to ignore the calls in between.
+    builtin_open.assert_has_calls(open_calls, any_order=True)
+    # *** Unfortunately it's not possible to patch the default contents, because get_time is evaluated at function
+    #     definition time and not at its call time. Let's at least test it's earlier and close enough. The way its
+    #     written is rather ugly, but that's just how it works.
+    builtin_open.return_value.__enter__.return_value.write.assert_has_calls(write_calls, any_order=True)
+
+    remove_calls = []
     for u in constants.unregistered_files:
-        assert os.path.isfile(u) is False
+        remove_call = call(u)
+        remove_calls.append(remove_call)
+    os_remove.assert_has_calls(remove_calls, any_order=True)
 
 
 @pytest.mark.skip(reason="Mocked paths not working in QE jenkins")
